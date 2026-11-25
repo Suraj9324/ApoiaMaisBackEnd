@@ -1,0 +1,207 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+      - "test/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: API (Python)
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: ApoiaMaisDB
+          MYSQL_USER: test
+          MYSQL_PASSWORD: test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -u test -ptest"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+      rabbitmq:
+        image: rabbitmq:3.13-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: test
+          RABBITMQ_DEFAULT_PASS: test
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd="rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval=10s
+          --health-timeout=10s
+          --health-retries=12
+
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_USER: test
+      DB_PASSWORD: test
+      DB_NAME: ApoiaMaisDB
+      JWT_SECRET_KEY: test-secret-key-for-ci
+      RABBITMQ_URL: amqp://test:test@127.0.0.1:5672/
+      # tests/integration/database/test_migrations.py cria bancos descartáveis com este usuário
+      MIGRATIONS_TEST_ADMIN_URL: mysql+pymysql://root:root@127.0.0.1:3306
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run migrations (upgrade, downgrade, upgrade, check)
+        run: |
+          python -m alembic -c app/alembic.ini upgrade head
+          python -m alembic -c app/alembic.ini downgrade base
+          python -m alembic -c app/alembic.ini upgrade head
+          # falha se os models divergirem das migrations (falta migration ou model errado)
+          python -m alembic -c app/alembic.ini check
+
+      - name: Run tests
+        run: |
+          pytest -v
+
+  go-worker:
+    name: go-worker (Go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/go-worker
+
+    services:
+      rabbitmq:
+        image: rabbitmq:3.13-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: test
+          RABBITMQ_DEFAULT_PASS: test
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd="rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval=10s
+          --health-timeout=10s
+          --health-retries=12
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: workers/go-worker/go.mod
+          cache-dependency-path: workers/go-worker/go.sum
+
+      - name: Format
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        env:
+          AMQP_TEST_URL: amqp://test:test@127.0.0.1:5672/
+        run: go test -race -count=1 ./...
+
+  rust-evaluator:
+    name: rust-evaluator (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workers/rust-evaluator
+
+    services:
+      rabbitmq:
+        image: rabbitmq:3.13-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: test
+          RABBITMQ_DEFAULT_PASS: test
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd="rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval=10s
+          --health-timeout=10s
+          --health-retries=12
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            workers/rust-evaluator/target
+          key: cargo-${{ runner.os }}-${{ hashFiles('workers/rust-evaluator/Cargo.lock') }}
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        env:
+          AMQP_TEST_URL: amqp://test:test@127.0.0.1:5672/%2f
+        run: cargo test --locked
+
+  docker:
+    name: Imagens e compose
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate docker-compose.yml
+        run: |
+          cp .env.example .env
+          docker compose config -q
+
+      - name: Build API image
+        run: docker build -t apoiamais-api:ci .
+
+      - name: Build go-worker image
+        run: docker build -t apoiamais-go-worker:ci workers/go-worker
+
+      - name: Build rust-evaluator image
+        run: docker build -t apoiamais-rust-evaluator:ci workers/rust-evaluator
+
+      # mesmo caminho do ambiente real: MySQL do compose + container migrate
+      - name: Migrations no docker compose
+        run: |
+          cp .env.example .env
+          docker compose up -d --wait mysql
+          docker compose run --rm migrate
+          docker compose run --rm migrate python -m alembic -c app/alembic.ini check
+          docker compose down -v
